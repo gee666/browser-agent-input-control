@@ -91,6 +91,30 @@ describe('parseCommand validation', () => {
   test('rejects zero repeat', () => {
     expect(() => parseCommand(baseMsg('press_key', { key: 'tab', repeat: 0 }))).toThrow();
   });
+
+  test('rejects missing context', () => {
+    expect(() =>
+      parseCommand({ id: 'cmd-1', command: 'pause', params: { duration_ms: 1 } })
+    ).toThrow(/Missing required field 'context'/);
+  });
+
+  test('rejects null context', () => {
+    expect(() =>
+      parseCommand({ id: 'cmd-1', command: 'pause', params: { duration_ms: 1 }, context: null })
+    ).toThrow(/Missing required field 'context'/);
+  });
+
+  test('rejects empty sequence.steps', () => {
+    expect(() => parseCommand(baseMsg('sequence', { steps: [] }))).toThrow(/at least one step/);
+  });
+
+  test('rejects empty press_key.key', () => {
+    expect(() => parseCommand(baseMsg('press_key', { key: '' }))).toThrow(/non-empty string/);
+  });
+
+  test('rejects empty string in press_shortcut.keys[]', () => {
+    expect(() => parseCommand(baseMsg('press_shortcut', { keys: ['ctrl', ''] }))).toThrow(/non-empty string/);
+  });
 });
 
 describe('Dispatcher routing', () => {

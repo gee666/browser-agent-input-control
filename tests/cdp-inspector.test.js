@@ -1,3 +1,11 @@
+// Note on test coupling (review Low #8): these tests exercise the CdpInspector
+// class implemented in the sibling pi-browser-agent-bridge package directly.
+// That keeps the tests close to the real runtime behaviour the bridge
+// depends on, but it couples this package’s tests to a sibling's source
+// layout. A thin contract-test layer (mocking the inspector interface) is
+// intentionally left to a follow-up; the DebuggerTransport tests above
+// already exercise inspector-backed and API-backed paths through a FakeApi,
+// so the inspector interface is in practice validated at this boundary.
 import { describe, expect, test } from '@jest/globals';
 import { CdpInspector } from '../../pi-browser-agent-bridge/src/cdp-inspector.js';
 

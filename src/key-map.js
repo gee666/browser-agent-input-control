@@ -157,9 +157,23 @@ export function resolveKey(name) {
   return { key: pretty, code: pretty, windowsVirtualKeyCode: 0 };
 }
 
-/** Resolve a single character for `type` / press-key of a single char. */
+/**
+ * Resolve a single character for `type` / press-key of a single char.
+ *
+ * `ch` may be a single UTF-16 code unit (length 1) for BMP characters, OR a
+ * surrogate pair (length 2) for astral / non-BMP code points such as emoji.
+ * Callers iterate with `for...of` or `[...str]` so a single code point is
+ * always passed in here — never a lone surrogate half.
+ */
 export function resolveCharacter(ch) {
-  if (ch.length !== 1) throw new RangeError('character must be length 1');
+  if (typeof ch !== 'string' || ch.length === 0) {
+    throw new RangeError('character must be a non-empty string');
+  }
+  // Exactly one code point: length 1 (BMP) or a valid surrogate pair (length 2).
+  const codePoints = [...ch];
+  if (codePoints.length !== 1) {
+    throw new RangeError('character must be a single code point');
+  }
   if (ch === '\n' || ch === '\r') return { ...NAMED_KEYS.enter };
   if (ch === '\t') return { ...NAMED_KEYS.tab };
   if (ch === ' ') return { ...NAMED_KEYS.space };
@@ -234,11 +248,13 @@ export function resolveCharacter(ch) {
     };
   }
 
-  // Fallback — any other printable char.
+  // Fallback — any other printable char. Use codePointAt() rather than
+  // charCodeAt() so astral code points (emoji, etc.) keep their full value
+  // instead of being truncated to the lead surrogate.
   return {
     key: ch,
     code: '',
-    windowsVirtualKeyCode: ch.charCodeAt(0),
+    windowsVirtualKeyCode: ch.codePointAt(0) || 0,
     text: ch,
   };
 }

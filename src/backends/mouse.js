@@ -10,6 +10,7 @@ import {
   distanceBetweenPoints,
 } from '../mouse-motion.js';
 import { estimateMouseDurationMs } from '../timing.js';
+import { InputControlError } from '../errors.js';
 
 function mouseEvent(type, x, y, extras = {}) {
   return {
@@ -21,48 +22,90 @@ function mouseEvent(type, x, y, extras = {}) {
 }
 
 export class CdpMouseBackend {
-  constructor({ transport, getTabId, rng }) {
+  constructor({ transport, rng, getTabId } = {}) {
     this._transport = transport;
-    this._getTabId = getTabId;
     this._rng = rng;
-    this._lastPoint = { x: 0, y: 0 };
+    // Legacy getTabId() hook — only consulted when the dispatcher didn't
+    // supply a command-scoped tabId (older callers / direct unit-test usage).
+    this._legacyGetTabId = typeof getTabId === 'function' ? getTabId : null;
+    // Cursor history is kept per-tab-id. A command that starts on tab B can
+    // never inherit coordinates that belonged to tab A.
+    this._lastPoints = new Map(); // Map<number, {x, y}>
   }
 
-  async _dispatch(method, params) {
-    const tabId = this._getTabId();
+  /** Clear all cached cursor positions (called on abort / detach). */
+  resetState() {
+    this._lastPoints.clear();
+  }
+
+  /** Drop cursor history for a single tab (e.g. active-tab changed). */
+  forgetTab(tabId) {
+    this._lastPoints.delete(tabId);
+  }
+
+  _resolveTabId(execContext) {
+    if (execContext && typeof execContext.tabId === 'number') return execContext.tabId;
+    if (this._legacyGetTabId) {
+      const tabId = this._legacyGetTabId();
+      if (typeof tabId !== 'number') {
+        throw new InputControlError('No active tab resolved for CDP command');
+      }
+      return tabId;
+    }
+    throw new InputControlError('No active tab resolved for CDP command');
+  }
+
+  _getLastPoint(tabId) {
+    return this._lastPoints.get(tabId) || { x: 0, y: 0 };
+  }
+
+  _setLastPoint(tabId, point) {
+    this._lastPoints.set(tabId, { x: point.x, y: point.y });
+  }
+
+  async _dispatch(tabId, method, params) {
     return this._transport.send(tabId, method, params);
   }
 
-  async _dispatchMouseEvent(params) {
-    return this._dispatch('Input.dispatchMouseEvent', params);
+  async _dispatchMouseEvent(tabId, params) {
+    return this._dispatch(tabId, 'Input.dispatchMouseEvent', params);
   }
 
-  async move(command, signal) {
+  async move(command, signal, execContext) {
     throwIfCancelled(signal);
+    const tabId = this._resolveTabId(execContext);
     const target = { x: command.x, y: command.y };
-    const distance = distanceBetweenPoints(this._lastPoint, target);
-    if (distance < 1) {
-      await this._dispatchMouseEvent(mouseEvent('mouseMoved', target.x, target.y));
-      this._lastPoint = target;
+    const lastPoint = this._getLastPoint(tabId);
+    const distance = distanceBetweenPoints(lastPoint, target);
+
+    // Zero-distance OR explicit instant-teleport: emit exactly one
+    // mouseMoved event at the target coordinates and bail out. The protocol
+    // says duration_ms === 0 MUST NOT emit intermediate hover events.
+    if (distance < 1 || command.durationMs === 0) {
+      await this._dispatchMouseEvent(tabId, mouseEvent('mouseMoved', target.x, target.y));
+      this._setLastPoint(tabId, target);
       return;
     }
-    const path = buildMousePath(this._lastPoint, target, this._rng);
+
+    const path = buildMousePath(lastPoint, target, this._rng);
     const durationMs = command.durationMs != null ? command.durationMs : estimateMouseDurationMs(distance);
     const perStepDelay = path.length > 1 ? durationMs / (path.length - 1) : 0;
     for (let i = 0; i < path.length; i++) {
       throwIfCancelled(signal);
       const p = path[i];
-      await this._dispatchMouseEvent(mouseEvent('mouseMoved', p.x, p.y));
+      await this._dispatchMouseEvent(tabId, mouseEvent('mouseMoved', p.x, p.y));
       if (i < path.length - 1 && perStepDelay > 0) {
         await cancellableSleep(perStepDelay, signal);
       }
     }
-    this._lastPoint = target;
+    this._setLastPoint(tabId, target);
   }
 
-  async click(command, signal) {
-    // Move to the target using the same humanised path logic.
-    await this.move({ x: command.x, y: command.y, durationMs: command.moveDurationMs }, signal);
+  async click(command, signal, execContext) {
+    const tabId = this._resolveTabId(execContext);
+    // Move to the target using the same humanised path logic. Zero move
+    // duration now correctly short-circuits to a single mouseMoved event.
+    await this.move({ x: command.x, y: command.y, durationMs: command.moveDurationMs }, signal, execContext);
 
     const button = command.button;
     const count = command.count || 1;
@@ -73,18 +116,19 @@ export class CdpMouseBackend {
     for (let i = 0; i < count; i++) {
       throwIfCancelled(signal);
       const clickCount = i + 1;
-      await this._dispatchMouseEvent(mouseEvent('mousePressed', command.x, command.y, { button, clickCount, buttons: buttonsMaskFor(button) }));
+      await this._dispatchMouseEvent(tabId, mouseEvent('mousePressed', command.x, command.y, { button, clickCount, buttons: buttonsMaskFor(button) }));
       await cancellableSleep(holdMs, signal);
-      await this._dispatchMouseEvent(mouseEvent('mouseReleased', command.x, command.y, { button, clickCount }));
+      await this._dispatchMouseEvent(tabId, mouseEvent('mouseReleased', command.x, command.y, { button, clickCount }));
       if (i < count - 1) {
         await cancellableSleep(intervalMs, signal);
       }
     }
   }
 
-  async scroll(command, signal) {
+  async scroll(command, signal, execContext) {
+    const tabId = this._resolveTabId(execContext);
     // Move to scroll anchor first.
-    await this.move({ x: command.x, y: command.y, durationMs: null }, signal);
+    await this.move({ x: command.x, y: command.y, durationMs: null }, signal, execContext);
     const steps = buildScrollSteps(command.deltaX, command.deltaY, this._rng, {
       durationMs: command.durationMs,
     });
@@ -97,6 +141,7 @@ export class CdpMouseBackend {
         continue;
       }
       await this._dispatchMouseEvent(
+        tabId,
         mouseEvent('mouseWheel', command.x, command.y, {
           deltaX: step.deltaX,
           deltaY: step.deltaY,

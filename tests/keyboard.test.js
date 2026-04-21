@@ -48,6 +48,36 @@ describe('CdpKeyboardBackend.typeText', () => {
     expect(transport.calls).toHaveLength(0);
   });
 
+  test('emoji is typed as ONE key event pair, not two surrogate halves', async () => {
+    const { transport, backend } = mk();
+    await backend.typeText({ text: '😀', wpm: 10000 }, null);
+    const events = transport.calledWith('Input.dispatchKeyEvent');
+    // One keyDown + one keyUp for the whole emoji code point.
+    expect(events).toHaveLength(2);
+    expect(events[0].params.type).toBe('keyDown');
+    expect(events[0].params.key).toBe('😀');
+    expect(events[0].params.text).toBe('😀');
+    expect(events[1].params.type).toBe('keyUp');
+    expect(events[1].params.key).toBe('😀');
+  });
+
+  test('accented characters type as one code point each', async () => {
+    const { transport, backend } = mk();
+    await backend.typeText({ text: 'éñ', wpm: 10000 }, null);
+    const events = transport.calledWith('Input.dispatchKeyEvent');
+    // 2 code points * (keyDown + keyUp) = 4 events.
+    expect(events).toHaveLength(4);
+    expect(events[0].params.key).toBe('é');
+    expect(events[2].params.key).toBe('ñ');
+  });
+
+  test('mixed BMP + non-BMP string preserves each code point', async () => {
+    const { transport, backend } = mk();
+    await backend.typeText({ text: 'a😀b', wpm: 10000 }, null);
+    const downs = transport.calledWith('Input.dispatchKeyEvent').filter((c) => c.params.type === 'keyDown');
+    expect(downs.map((c) => c.params.key)).toEqual(['a', '😀', 'b']);
+  });
+
   test('inter-key delay scales with WPM — slow WPM takes longer', async () => {
     const { backend: fastBackend, transport: fastTr } = mk();
     const start = Date.now();
@@ -82,6 +112,22 @@ describe('CdpKeyboardBackend.pressKey', () => {
     expect(down).toHaveLength(3);
     expect(up).toHaveLength(3);
   });
+
+  test('press_key pauses between keyDown and keyUp', async () => {
+    const { backend } = mk();
+    const start = Date.now();
+    await backend.pressKey({ key: 'tab', repeat: 1 }, null);
+    // Hold delay is >= KEY_PRESS_HOLD_MIN_MS (50ms); allow clock slack.
+    expect(Date.now() - start).toBeGreaterThanOrEqual(30);
+  });
+
+  test('press_key pauses between repeats', async () => {
+    const { backend } = mk();
+    const start = Date.now();
+    await backend.pressKey({ key: 'tab', repeat: 3 }, null);
+    // 3 holds + 2 inter-repeat delays ≈ >= 5 * 50ms = 250ms. Allow slack.
+    expect(Date.now() - start).toBeGreaterThanOrEqual(150);
+  });
 });
 
 describe('CdpKeyboardBackend.pressShortcut', () => {
@@ -107,5 +153,52 @@ describe('CdpKeyboardBackend.pressShortcut', () => {
     const final = transport.calls.find((c) => c.params.key === 'k' && c.params.type === 'keyDown');
     expect(final.params.modifiers & MODIFIER_BITS.ctrl).toBeTruthy();
     expect(final.params.modifiers & MODIFIER_BITS.shift).toBeTruthy();
+  });
+
+  test('ctrl+A (uppercase letter) emits a real Shift keyDown/keyUp around the terminal key', async () => {
+    const { transport, backend } = mk();
+    await backend.pressShortcut({ keys: ['ctrl', 'A'] }, null);
+    const events = transport.calledWith('Input.dispatchKeyEvent').map((c) => ({
+      type: c.params.type,
+      key: c.params.key,
+    }));
+    // Expected order: Ctrl↓, Shift↓, A↓, A↑, Shift↑, Ctrl↑.
+    expect(events).toEqual([
+      { type: 'keyDown', key: 'Control' },
+      { type: 'keyDown', key: 'Shift' },
+      { type: 'keyDown', key: 'A' },
+      { type: 'keyUp', key: 'A' },
+      { type: 'keyUp', key: 'Shift' },
+      { type: 'keyUp', key: 'Control' },
+    ]);
+    const aDown = transport.calls.find((c) => c.params.key === 'A' && c.params.type === 'keyDown');
+    expect(aDown.params.modifiers & MODIFIER_BITS.ctrl).toBeTruthy();
+    expect(aDown.params.modifiers & MODIFIER_BITS.shift).toBeTruthy();
+  });
+
+  test('ctrl+? (shifted symbol) emits real Shift keyDown/keyUp around the terminal key', async () => {
+    const { transport, backend } = mk();
+    await backend.pressShortcut({ keys: ['ctrl', '?'] }, null);
+    const events = transport.calledWith('Input.dispatchKeyEvent').map((c) => ({
+      type: c.params.type,
+      key: c.params.key,
+    }));
+    expect(events).toEqual([
+      { type: 'keyDown', key: 'Control' },
+      { type: 'keyDown', key: 'Shift' },
+      { type: 'keyDown', key: '?' },
+      { type: 'keyUp', key: '?' },
+      { type: 'keyUp', key: 'Shift' },
+      { type: 'keyUp', key: 'Control' },
+    ]);
+  });
+
+  test('ctrl+shift+A does NOT emit a duplicate Shift event when Shift is already held', async () => {
+    const { transport, backend } = mk();
+    await backend.pressShortcut({ keys: ['ctrl', 'shift', 'A'] }, null);
+    const shiftDowns = transport.calls.filter((c) => c.params.key === 'Shift' && c.params.type === 'keyDown');
+    const shiftUps = transport.calls.filter((c) => c.params.key === 'Shift' && c.params.type === 'keyUp');
+    expect(shiftDowns).toHaveLength(1);
+    expect(shiftUps).toHaveLength(1);
   });
 });

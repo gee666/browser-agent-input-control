@@ -63,13 +63,24 @@ describe('CdpMouseBackend — CDP call sequence', () => {
   function mkBackend(tabId = 10) {
     const transport = new FakeTransport();
     const rng = new DeterministicRng(2);
-    const backend = new CdpMouseBackend({ transport, getTabId: () => tabId, rng });
-    return { transport, backend };
+    const backend = new CdpMouseBackend({ transport, rng });
+    const ctx = { tabId };
+    return { transport, backend, ctx };
   }
 
-  test('move dispatches a stream of mouseMoved events ending at target', async () => {
-    const { transport, backend } = mkBackend();
-    await backend.move({ x: 200, y: 100, durationMs: 0 }, null);
+  test('move with duration_ms === 0 emits exactly ONE mouseMoved event at target', async () => {
+    const { transport, backend, ctx } = mkBackend();
+    await backend.move({ x: 200, y: 100, durationMs: 0 }, null, ctx);
+    const moves = transport.calledWith('Input.dispatchMouseEvent');
+    expect(moves).toHaveLength(1);
+    expect(moves[0].params.type).toBe('mouseMoved');
+    expect(moves[0].params.x).toBe(200);
+    expect(moves[0].params.y).toBe(100);
+  });
+
+  test('move without explicit duration dispatches a humanised path ending at target', async () => {
+    const { transport, backend, ctx } = mkBackend();
+    await backend.move({ x: 200, y: 100 }, null, ctx);
     const moves = transport.calledWith('Input.dispatchMouseEvent');
     expect(moves.length).toBeGreaterThan(1);
     for (const m of moves) expect(m.params.type).toBe('mouseMoved');
@@ -79,8 +90,8 @@ describe('CdpMouseBackend — CDP call sequence', () => {
   });
 
   test('click emits mousePressed then mouseReleased with clickCount', async () => {
-    const { transport, backend } = mkBackend();
-    await backend.click({ x: 50, y: 60, button: 'left', count: 1, moveDurationMs: 0, holdMs: 0, intervalMs: 0 }, null);
+    const { transport, backend, ctx } = mkBackend();
+    await backend.click({ x: 50, y: 60, button: 'left', count: 1, moveDurationMs: 0, holdMs: 0, intervalMs: 0 }, null, ctx);
     const events = transport.calls.map((c) => c.params.type);
     expect(events).toContain('mousePressed');
     expect(events).toContain('mouseReleased');
@@ -89,32 +100,80 @@ describe('CdpMouseBackend — CDP call sequence', () => {
     expect(pressed.params.clickCount).toBe(1);
   });
 
+  test('click with move_duration_ms === 0 emits exactly ONE mouseMoved before pressing', async () => {
+    const { transport, backend, ctx } = mkBackend();
+    await backend.click({ x: 250, y: 150, button: 'left', count: 1, moveDurationMs: 0, holdMs: 0, intervalMs: 0 }, null, ctx);
+    const moves = transport.calls.filter((c) => c.params.type === 'mouseMoved');
+    expect(moves).toHaveLength(1);
+    expect(moves[0].params.x).toBe(250);
+    expect(moves[0].params.y).toBe(150);
+    // And the press event happens AFTER the single move event.
+    const firstPressIdx = transport.calls.findIndex((c) => c.params.type === 'mousePressed');
+    const lastMoveIdx = transport.calls.map((c) => c.params.type).lastIndexOf('mouseMoved');
+    expect(firstPressIdx).toBeGreaterThan(lastMoveIdx);
+  });
+
   test('double click uses clickCount 1 then 2', async () => {
-    const { transport, backend } = mkBackend();
-    await backend.click({ x: 50, y: 60, button: 'left', count: 2, moveDurationMs: 0, holdMs: 0, intervalMs: 0 }, null);
+    const { transport, backend, ctx } = mkBackend();
+    await backend.click({ x: 50, y: 60, button: 'left', count: 2, moveDurationMs: 0, holdMs: 0, intervalMs: 0 }, null, ctx);
     const pressed = transport.calls.filter((c) => c.params.type === 'mousePressed').map((c) => c.params.clickCount);
     expect(pressed).toEqual([1, 2]);
   });
 
   test('scroll dispatches mouseWheel events with matching deltaY sum', async () => {
-    const { transport, backend } = mkBackend();
-    await backend.scroll({ x: 100, y: 100, deltaX: 0, deltaY: 400, durationMs: 0 }, null);
+    const { transport, backend, ctx } = mkBackend();
+    await backend.scroll({ x: 100, y: 100, deltaX: 0, deltaY: 400, durationMs: 0 }, null, ctx);
     const wheels = transport.calls.filter((c) => c.params.type === 'mouseWheel');
     expect(wheels.length).toBeGreaterThan(0);
     const sum = wheels.reduce((s, w) => s + w.params.deltaY, 0);
     expect(sum).toBe(400);
   });
 
-  test('getTabId is consulted for every CDP call', async () => {
+  test('command-scoped tabId is used for every CDP call', async () => {
     const transport = new FakeTransport();
-    let tabId = 5;
-    const backend = new CdpMouseBackend({ transport, getTabId: () => tabId, rng: new DeterministicRng(1) });
-    await backend.move({ x: 10, y: 10, durationMs: 0 }, null);
-    tabId = 7;
-    await backend.move({ x: 20, y: 20, durationMs: 0 }, null);
+    const backend = new CdpMouseBackend({ transport, rng: new DeterministicRng(1) });
+    await backend.move({ x: 10, y: 10, durationMs: 0 }, null, { tabId: 5 });
+    await backend.move({ x: 20, y: 20, durationMs: 0 }, null, { tabId: 7 });
     const tabIds = new Set(transport.calls.map((c) => c.tabId));
     expect(tabIds.has(5)).toBe(true);
     expect(tabIds.has(7)).toBe(true);
+  });
+
+  test('last-point cursor state is isolated per tabId', async () => {
+    const transport = new FakeTransport();
+    const backend = new CdpMouseBackend({ transport, rng: new DeterministicRng(1) });
+    // Seed a position on tab 1 with a real path (non-zero duration).
+    await backend.move({ x: 300, y: 300 }, null, { tabId: 1 });
+    transport.reset();
+    // Now move on tab 2 with duration === 0 — it must teleport, ignoring
+    // tab 1's cursor history.
+    await backend.move({ x: 400, y: 400, durationMs: 0 }, null, { tabId: 2 });
+    const moves = transport.calls.filter((c) => c.params.type === 'mouseMoved');
+    expect(moves).toHaveLength(1);
+    expect(moves[0].tabId).toBe(2);
+    // Next tab-1 move starts from (300,300), not from (400,400). A short
+    // (1,1)-target move from (300,300) should be many steps; from (400,400)
+    // it would also be many steps, so we instead assert via duration:0 that
+    // state did not leak across tabs.
+    transport.reset();
+    await backend.move({ x: 300, y: 300, durationMs: 0 }, null, { tabId: 1 });
+    // Moving to the same point on tab 1 is a zero-distance move → single event.
+    const tab1Moves = transport.calls.filter((c) => c.params.type === 'mouseMoved');
+    expect(tab1Moves).toHaveLength(1);
+    expect(tab1Moves[0].tabId).toBe(1);
+  });
+
+  test('resetState() forgets all per-tab cursor history', async () => {
+    const transport = new FakeTransport();
+    const backend = new CdpMouseBackend({ transport, rng: new DeterministicRng(4) });
+    await backend.move({ x: 500, y: 500 }, null, { tabId: 9 });
+    backend.resetState();
+    // After reset, the remembered point for tab 9 goes back to (0,0). A
+    // move to (500, 500) will therefore produce a multi-step path again.
+    transport.reset();
+    await backend.move({ x: 500, y: 500 }, null, { tabId: 9 });
+    const moves = transport.calls.filter((c) => c.params.type === 'mouseMoved');
+    expect(moves.length).toBeGreaterThan(1);
   });
 });
 

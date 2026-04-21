@@ -187,4 +187,69 @@ describe('CdpInputControlBridge public surface', () => {
     const res = await b.execute('press_key', { key: 'enter' }, context);
     expect(res.status).toBe('ok');
   });
+
+  test('concurrent execute() calls are serialised FIFO and each uses its own tabId', async () => {
+    // Simulates the tab-race scenario: the active tab changes between two
+    // overlapping execute() calls. The second command must NOT interleave
+    // CDP events with the first, and each command must see the tabId that
+    // was active when it started.
+    const transport = new FakeTransport();
+    const browserBridge = new FakeBrowserBridge(1);
+    // Override getActiveTabId to record call order — the value returned
+    // flips after the first call.
+    let nextTabId = 10;
+    browserBridge.getActiveTabId = async () => {
+      const v = nextTabId;
+      nextTabId = (v === 10) ? 20 : v;
+      return v;
+    };
+
+    const b = new CdpInputControlBridge({ bridge: browserBridge, transport });
+    const p1 = b.execute('type', { text: 'abc', wpm: 10000 }, {});
+    const p2 = b.execute('type', { text: 'xyz', wpm: 10000 }, {});
+    await Promise.all([p1, p2]);
+
+    // Order each call's key events.
+    const callsByTab = new Map();
+    for (const c of transport.calls) {
+      if (!callsByTab.has(c.tabId)) callsByTab.set(c.tabId, []);
+      callsByTab.get(c.tabId).push(c);
+    }
+    // First command went to tab 10, second to tab 20 — each must be a
+    // contiguous run in transport.calls (no interleaving).
+    const tabSequence = transport.calls.map((c) => c.tabId);
+    // Compressed: only boundaries. Expect exactly one boundary (10→20).
+    const boundaries = [];
+    for (let i = 1; i < tabSequence.length; i++) {
+      if (tabSequence[i] !== tabSequence[i - 1]) boundaries.push(i);
+    }
+    expect(boundaries).toHaveLength(1);
+    expect(tabSequence[0]).toBe(10);
+    expect(tabSequence[tabSequence.length - 1]).toBe(20);
+  });
+
+  test('a second execute() does NOT overwrite an in-flight command’s tabId mid-flight', async () => {
+    // Even if the bridge’s active-tab flips while command A is still
+    // emitting CDP events, every CDP call from A must go to tab A. The
+    // active-tab value is returned via a counter so each call to
+    // getActiveTabId() sees a different tab, mirroring a real tab-switch.
+    const transport = new FakeTransport();
+    const tabSequence = [100, 200];
+    let i = 0;
+    const bridgeApi = {
+      getActiveTabId: async () => tabSequence[Math.min(i++, tabSequence.length - 1)],
+    };
+    const b = new CdpInputControlBridge({ bridge: bridgeApi, transport });
+    const p1 = b.execute('type', { text: 'hello', wpm: 10000 }, {});
+    const p2 = b.execute('type', { text: 'world', wpm: 10000 }, {});
+    await Promise.all([p1, p2]);
+    // typeText on 'hello' emits 5 * 2 = 10 key events, then 'world' another 10.
+    // Because execute() serialises, those two runs appear contiguously in
+    // transport.calls; the tabId under each run must be the one resolved at
+    // the start of that run.
+    const firstHalf = transport.calls.slice(0, 10);
+    const secondHalf = transport.calls.slice(10);
+    expect(firstHalf.every((c) => c.tabId === 100)).toBe(true);
+    expect(secondHalf.every((c) => c.tabId === 200)).toBe(true);
+  });
 });

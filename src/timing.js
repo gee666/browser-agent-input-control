@@ -53,3 +53,10 @@ export const SHORTCUT_DELAY_MIN_MS = 50.0;
 export const SHORTCUT_DELAY_MAX_MS = 100.0;
 export const TYPING_JITTER_RATIO = 0.25;
 export const MIN_INTER_KEY_DELAY_MS = 10.0;
+// Small pause between a press_key keyDown and its matching keyUp, and
+// between repeated presses. Shared with shortcut handling so keyboard
+// pacing is consistent across all keyboard commands.
+export const KEY_PRESS_HOLD_MIN_MS = SHORTCUT_DELAY_MIN_MS;
+export const KEY_PRESS_HOLD_MAX_MS = SHORTCUT_DELAY_MAX_MS;
+export const KEY_REPEAT_DELAY_MIN_MS = SHORTCUT_DELAY_MIN_MS;
+export const KEY_REPEAT_DELAY_MAX_MS = SHORTCUT_DELAY_MAX_MS;

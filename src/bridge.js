@@ -46,20 +46,13 @@ export class CdpInputControlBridge {
     this._browserBridge = options.bridge || null;
     this._rng = options.rng || new SeededRandom();
     this._transport = options.transport || new DebuggerTransport({ inspector: options.inspector });
-    this._activeTabId = null;
 
-    const getTabId = () => {
-      if (this._activeTabId == null) {
-        throw new InputControlError('No active tab resolved for CDP command');
-      }
-      return this._activeTabId;
-    };
-
-    this._mouse = options.mouseBackend || new CdpMouseBackend({ transport: this._transport, getTabId, rng: this._rng });
-    this._keyboard = options.keyboardBackend || new CdpKeyboardBackend({ transport: this._transport, getTabId, rng: this._rng });
+    this._mouse = options.mouseBackend || new CdpMouseBackend({ transport: this._transport, rng: this._rng });
+    this._keyboard = options.keyboardBackend || new CdpKeyboardBackend({ transport: this._transport, rng: this._rng });
     this._dispatcher = new Dispatcher({ mouseBackend: this._mouse, keyboardBackend: this._keyboard });
 
     this._pending = new Set(); // Set<{ reject, controller, timer }>
+    this._queue = Promise.resolve(); // Serialises execute() bodies.
     this._closed = false;
   }
 
@@ -71,7 +64,6 @@ export class CdpInputControlBridge {
     if (typeof tabId !== 'number') {
       throw new InputControlError('getActiveTabId() did not return a numeric tab id');
     }
-    this._activeTabId = tabId;
     return tabId;
   }
 
@@ -79,6 +71,10 @@ export class CdpInputControlBridge {
    * Execute one command. Resolves with { id, status: 'ok' } on success, or
    * rejects with an InputControlError / InputControlAbortError /
    * InputControlTimeoutError on failure.
+   *
+   * Concurrent execute() calls are serialised internally in FIFO order so
+   * that a long-running command on tab A can't have its target or cursor
+   * state stepped on by a second execute() that happens to resolve tab B.
    */
   execute(command, params, context) {
     if (this._closed) {
@@ -107,17 +103,30 @@ export class CdpInputControlBridge {
         rejectSafe(new InputControlTimeoutError());
       }, timeoutMs);
 
-      // Resolve tab id lazily on the first await so constructors stay sync.
-      (async () => {
+      // Chain on the queue so only one execute() body runs at a time.
+      const run = async () => {
+        // If the bridge was closed/aborted while we waited our turn, the
+        // entry has already been removed from _pending by _abortPending()
+        // and rejected.
+        if (!this._pending.has(entry)) return;
+        if (controller.signal.aborted) {
+          rejectSafe(new InputControlAbortError());
+          return;
+        }
+        let tabId;
         try {
-          await this._resolveTabId();
+          tabId = await this._resolveTabId();
         } catch (err) {
           rejectSafe(err instanceof InputControlError ? err : new InputControlError(String(err && err.message || err)));
           return;
         }
+        // Command-scoped execution context: tabId is resolved ONCE here and
+        // passed down to every backend call, so a second execute() that
+        // changes the active tab mid-flight cannot affect this command.
+        const execContext = { tabId };
         let response;
         try {
-          response = await this._dispatcher.handle(envelope, controller.signal);
+          response = await this._dispatcher.handle(envelope, controller.signal, execContext);
         } catch (err) {
           // Defensive: dispatcher.handle should never throw.
           rejectSafe(err instanceof Error ? err : new InputControlError(String(err)));
@@ -132,7 +141,10 @@ export class CdpInputControlBridge {
           return;
         }
         resolveSafe(response);
-      })();
+      };
+
+      // Keep the queue healthy even if run() rejects (it shouldn't, but be safe).
+      this._queue = this._queue.then(run, run);
     });
   }
 
@@ -149,7 +161,12 @@ export class CdpInputControlBridge {
       }
       entry.reject(abortError);
     }
-    this._activeTabId = null;
+    // Drop stored cursor history — any new command must start from a fresh
+    // per-tab point, not from coordinates that belonged to a torn-down
+    // command.
+    if (this._mouse && typeof this._mouse.resetState === 'function') {
+      this._mouse.resetState();
+    }
   }
 
   /**

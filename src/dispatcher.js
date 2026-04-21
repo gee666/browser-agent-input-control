@@ -88,6 +88,12 @@ function requireString(params, field, commandId) {
   return v;
 }
 
+function requireNonEmptyString(params, field, commandId) {
+  const v = requireString(params, field, commandId);
+  if (v.length === 0) throw vErr(`Field '${field}' must be a non-empty string`, commandId);
+  return v;
+}
+
 function optionalMouseButton(params, field, commandId) {
   if (!(field in params) || params[field] == null) return 'left';
   const v = params[field];
@@ -106,6 +112,7 @@ function parseShortcutKeys(params, commandId) {
     }
     keys = raw.map((k, i) => {
       if (typeof k !== 'string') throw vErr(`Field 'keys[${i}]' must be a string`, commandId);
+      if (k.length === 0) throw vErr(`Field 'keys[${i}]' must be a non-empty string`, commandId);
       return k;
     });
   } else if ('shortcut' in params && params.shortcut != null) {
@@ -119,9 +126,11 @@ function parseShortcutKeys(params, commandId) {
 }
 
 function parseBrowserContext(value, commandId) {
-  // Context is optional for CDP — but if provided, validate it like python does
-  // so bad values don't sneak through. Missing context entirely is accepted as {}.
-  if (value == null) return {};
+  // Protocol requires a context object on every top-level envelope. We
+  // only validate the OS-backend geometry fields if the caller actually
+  // populated them; the CDP backend doesn't need them itself, but missing
+  // context entirely is a contract violation and is rejected.
+  if (value == null) throw vErr("Missing required field 'context'", commandId);
   if (typeof value !== 'object' || Array.isArray(value)) {
     throw vErr("Field 'context' must be an object", commandId);
   }
@@ -241,7 +250,7 @@ function buildCommand(commandName, commandId, context, params, allowSequence) {
         kind: 'press_key',
         id: commandId,
         context,
-        key: requireString(params, 'key', commandId),
+        key: requireNonEmptyString(params, 'key', commandId),
         repeat: optionalPositiveInt(params, 'repeat', commandId) || 1,
       };
     case 'press_shortcut':
@@ -263,6 +272,7 @@ function buildCommand(commandName, commandId, context, params, allowSequence) {
       if (!('steps' in params)) throw vErr("Missing required field 'steps'", commandId);
       const steps = params.steps;
       if (!Array.isArray(steps)) throw vErr("Field 'steps' must be an array", commandId);
+      if (steps.length === 0) throw vErr("Field 'steps' must contain at least one step", commandId);
       const parsedSteps = [];
       for (let i = 0; i < steps.length; i++) {
         const raw = steps[i];
@@ -297,11 +307,11 @@ export class Dispatcher {
     this.keyboard = keyboardBackend;
   }
 
-  async handle(raw, signal) {
+  async handle(raw, signal, execContext) {
     const fallbackId = typeof raw?.id === 'string' && raw.id ? raw.id : null;
     try {
       const command = parseCommand(raw);
-      await this.route(command, signal);
+      await this.route(command, signal, execContext);
       return { id: command.id, status: 'ok' };
     } catch (err) {
       if (err && err.name === 'CommandCancelledError') {
@@ -312,19 +322,19 @@ export class Dispatcher {
     }
   }
 
-  async route(command, signal) {
+  async route(command, signal, execContext) {
     if (command.kind === 'sequence') {
       for (const step of command.steps) {
-        await this.route(step, signal);
+        await this.route(step, signal, execContext);
       }
       return;
     }
-    if (command.kind === 'mouse_move') return this.mouse.move(command, signal);
-    if (command.kind === 'mouse_click') return this.mouse.click(command, signal);
-    if (command.kind === 'scroll') return this.mouse.scroll(command, signal);
-    if (command.kind === 'press_key') return this.keyboard.pressKey(command, signal);
-    if (command.kind === 'press_shortcut') return this.keyboard.pressShortcut(command, signal);
-    if (command.kind === 'type') return this.keyboard.typeText(command, signal);
+    if (command.kind === 'mouse_move') return this.mouse.move(command, signal, execContext);
+    if (command.kind === 'mouse_click') return this.mouse.click(command, signal, execContext);
+    if (command.kind === 'scroll') return this.mouse.scroll(command, signal, execContext);
+    if (command.kind === 'press_key') return this.keyboard.pressKey(command, signal, execContext);
+    if (command.kind === 'press_shortcut') return this.keyboard.pressShortcut(command, signal, execContext);
+    if (command.kind === 'type') return this.keyboard.typeText(command, signal, execContext);
     if (command.kind === 'pause') {
       const { cancellableSleep } = await import('./cancel.js');
       return cancellableSleep(command.durationMs, signal);
