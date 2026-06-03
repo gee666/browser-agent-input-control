@@ -2,12 +2,16 @@
 // disconnect surface as browser-agent-core's InputControlBridge, and its
 // error classes have compatible names.
 
-import { describe, expect, test } from '@jest/globals';
+import { describe, expect, jest, test, afterEach } from '@jest/globals';
 import { CdpInputControlBridge } from '../src/bridge.js';
 import { InputControlAbortError, InputControlError, InputControlTimeoutError } from '../src/errors.js';
 import { FakeBrowserBridge, FakeTransport } from './_fakes.js';
 
 describe('CdpInputControlBridge public surface', () => {
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
   test('exposes execute/abort/disconnect methods', () => {
     const b = new CdpInputControlBridge({ bridge: new FakeBrowserBridge() });
     expect(typeof b.execute).toBe('function');
@@ -251,5 +255,46 @@ describe('CdpInputControlBridge public surface', () => {
     const secondHalf = transport.calls.slice(10);
     expect(firstHalf.every((c) => c.tabId === 100)).toBe(true);
     expect(secondHalf.every((c) => c.tabId === 200)).toBe(true);
+  });
+
+  test('timeout aborts wedged CDP command and next execute can start', async () => {
+    jest.useFakeTimers();
+    const transport = new FakeTransport();
+    let detachCalls = 0;
+    transport.detach = async () => {
+      detachCalls += 1;
+      transport.attached.clear();
+    };
+    transport.send = async (tabId, method, params) => {
+      transport.attached.add(tabId);
+      transport.calls.push({ tabId, method, params });
+      if (method === 'Input.dispatchMouseEvent') {
+        return await new Promise(() => {});
+      }
+      return {};
+    };
+
+    const b = new CdpInputControlBridge({ bridge: new FakeBrowserBridge(9), transport });
+    const stuck = b.execute('mouse_move', { x: 1, y: 1, duration_ms: 0, timeout_ms: 5 }, {})
+      .catch((error) => error);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    await jest.advanceTimersByTimeAsync(6);
+    await expect(stuck).resolves.toBeInstanceOf(InputControlTimeoutError);
+    await Promise.resolve();
+    expect(detachCalls).toBeGreaterThanOrEqual(1);
+
+    // Replace the send implementation to prove the queue was recovered and a
+    // later command is not stuck behind the timed-out body.
+    transport.send = async (tabId, method, params) => {
+      transport.attached.add(tabId);
+      transport.calls.push({ tabId, method, params });
+      return {};
+    };
+    const ok = b.execute('pause', { duration_ms: 1, timeout_ms: 100 }, {});
+    await Promise.resolve();
+    await jest.advanceTimersByTimeAsync(1);
+    await expect(ok).resolves.toMatchObject({ status: 'ok' });
   });
 });

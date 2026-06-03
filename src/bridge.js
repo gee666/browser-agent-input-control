@@ -22,13 +22,16 @@ function randomId() {
  * ActionExecutor doesn't need to know which bridge it got.
  */
 function timeoutFor(command, params) {
+  if (Number.isFinite(params?.timeout_ms) && params.timeout_ms > 0) {
+    return Math.ceil(params.timeout_ms);
+  }
   if (command === 'type' && typeof params?.text === 'string') {
     const wpm = params.wpm || 60;
     const chars = params.text.length;
     const typingMs = Math.ceil((chars / (wpm * 5)) * 60_000);
-    return Math.max(30_000, typingMs + 10_000);
+    return Math.max(45_000, typingMs + 15_000);
   }
-  return 30_000;
+  return 45_000;
 }
 
 export class CdpInputControlBridge {
@@ -101,6 +104,14 @@ export class CdpInputControlBridge {
         if (!this._pending.has(entry)) return;
         controller.abort();
         rejectSafe(new InputControlTimeoutError());
+
+        // Timeouts must be self-healing. If a CDP input call is wedged (busy
+        // target, debugger hiccup, focus transition), the serial queue can stay
+        // blocked even after the caller has received the timeout. Detach the
+        // debugger and reset the queue so the next action starts from a clean
+        // session instead of cascading into more timeouts.
+        void this.abort();
+        this._queue = Promise.resolve();
       }, timeoutMs);
 
       // Chain on the queue so only one execute() body runs at a time.
