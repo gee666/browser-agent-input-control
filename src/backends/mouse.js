@@ -116,9 +116,19 @@ export class CdpMouseBackend {
     for (let i = 0; i < count; i++) {
       throwIfCancelled(signal);
       const clickCount = i + 1;
-      await this._dispatchMouseEvent(tabId, mouseEvent('mousePressed', command.x, command.y, { button, clickCount, buttons: buttonsMaskFor(button) }));
-      await cancellableSleep(holdMs, signal);
-      await this._dispatchMouseEvent(tabId, mouseEvent('mouseReleased', command.x, command.y, { button, clickCount }));
+      let pressed = false;
+      try {
+        await this._dispatchMouseEvent(tabId, mouseEvent('mousePressed', command.x, command.y, { button, clickCount, buttons: buttonsMaskFor(button) }));
+        pressed = true;
+        await cancellableSleep(holdMs, signal);
+      } finally {
+        // Release even when cancellation lands during the hold. Otherwise CDP
+        // can retain a pressed button and interpret later left clicks as an
+        // unintended context-menu gesture.
+        if (pressed) {
+          await this._dispatchMouseEvent(tabId, mouseEvent('mouseReleased', command.x, command.y, { button, clickCount, buttons: 0 }));
+        }
+      }
       if (i < count - 1) {
         await cancellableSleep(intervalMs, signal);
       }

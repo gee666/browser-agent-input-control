@@ -97,7 +97,28 @@ describe('CdpMouseBackend — CDP call sequence', () => {
     expect(events).toContain('mouseReleased');
     const pressed = transport.calls.find((c) => c.params.type === 'mousePressed');
     expect(pressed.params.button).toBe('left');
+    expect(pressed.params.buttons).toBe(1);
     expect(pressed.params.clickCount).toBe(1);
+    const released = transport.calls.find((c) => c.params.type === 'mouseReleased');
+    expect(released.params.button).toBe('left');
+    expect(released.params.buttons).toBe(0);
+  });
+
+  test('cancelling during click hold still releases the mouse button', async () => {
+    const { transport, backend, ctx } = mkBackend();
+    const controller = new AbortController();
+    const click = backend.click(
+      { x: 50, y: 60, button: 'left', count: 1, moveDurationMs: 0, holdMs: 1000, intervalMs: 0 },
+      controller.signal,
+      ctx,
+    );
+    while (!transport.calls.some((c) => c.params.type === 'mousePressed')) {
+      await Promise.resolve();
+    }
+    controller.abort();
+    await expect(click).rejects.toThrow(/cancel/i);
+    const released = transport.calls.find((c) => c.params.type === 'mouseReleased');
+    expect(released.params).toEqual(expect.objectContaining({ button: 'left', buttons: 0 }));
   });
 
   test('click with move_duration_ms === 0 emits exactly ONE mouseMoved before pressing', async () => {
